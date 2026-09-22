@@ -19,6 +19,7 @@ use std::{
 
 use super::{
     ARCHIVE_CANCELLED, ArchiveError, archive_failed,
+    destination::sanitize_member_path,
     extraction::{ArchiveOutcome, ExtractionSession, MemberContent},
 };
 
@@ -174,10 +175,7 @@ pub(super) fn extract_zip_from_archive(
             let mut entry = archive
                 .by_index_with_options(index, options)
                 .map_err(zip_error)?;
-            let name = entry.name().to_owned();
-            entry
-                .enclosed_name()
-                .ok_or_else(|| format!("Refusing unsafe ZIP path: {name}"))?;
+            let name = sanitize_member_path(entry.name());
             let declared_size = entry.size();
             let directory = entry.is_dir();
             let mut reader = ArchiveReader {
@@ -253,7 +251,7 @@ pub(super) fn extract_tar(
                 continue;
             }
             let declared_size = entry.size();
-            let name = name.to_string_lossy().into_owned();
+            let name = sanitize_member_path(&name.to_string_lossy());
             let mut reader = ArchiveReader::new(&mut entry);
             let content = if directory {
                 MemberContent::Directory
@@ -316,8 +314,9 @@ pub(super) fn extract_7z_from_reader(
             MemberContent::File(&mut reader, Some(entry.size))
         };
         submitted[index] = true;
+        let name = sanitize_member_path(&entry.name);
         session
-            .extract_member(&entry.name, content)
+            .extract_member(&name, content)
             .map_err(sevenz_error)?;
         Ok(true)
     });

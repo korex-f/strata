@@ -455,7 +455,7 @@ fn extraction_failures_stop_progress_and_preserve_error_distinctions() -> Result
         ("missing.zip", "No such file"),
         ("unreadable.zip", "Permission denied"),
         ("destination.zip", "Not a directory"),
-        ("unsafe.zip", "Refusing unsafe ZIP path"),
+        ("unsafe.zip", ""),
         ("unknown.iso", "Unsupported archive format"),
     ] {
         let archive = root.path().join(name);
@@ -500,6 +500,18 @@ fn extraction_failures_stop_progress_and_preserve_error_distinctions() -> Result
             );
             context.iteration(false);
             std::thread::yield_now();
+        }
+        if name == "unsafe.zip" {
+            assert!(matches!(
+                events.borrow().last(),
+                Some(OperationEvent::Extracted { first_name: Some(first_name), .. })
+                    if first_name == "outside"
+            ));
+            assert!(destination.join("outside").exists());
+            drop(handle);
+            assert!(!root.path().join("outside").exists());
+            fs::remove_file(destination.join("outside"))?;
+            continue;
         }
         assert!(
             matches!(events.borrow().last(), Some(OperationEvent::Failed { message, .. }) if message.contains(expected)),

@@ -8,6 +8,7 @@ use std::{
 };
 
 use super::{ArchiveError, ArchiveOutcome, ExtractionSession, MemberContent};
+use crate::adapters::local_operations::archive::destination::sanitize_member_path;
 use crate::model::Location;
 
 struct TestReader<F>(F);
@@ -49,6 +50,21 @@ fn members_share_conflict_names_and_count_only_completed_work() -> Result<(), Bo
         session.finish(Ok(()), || panic!("completion must not enumerate remaining members"))?,
         ArchiveOutcome::Completed(Some(name)) if name == "folder (2)"
     ));
+    Ok(())
+}
+
+#[test]
+fn sanitized_member_conflicts_use_numbered_names() -> Result<(), Box<dyn Error>> {
+    let root = tempfile::tempdir()?;
+    fs::write(root.path().join("escaped.txt"), b"original")?;
+    let progress = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let mut session = ExtractionSession::open(root.path(), &progress, &cancelled)?;
+    let name = sanitize_member_path("../escaped.txt");
+    session.extract_member(&name, MemberContent::File(&mut &b"new"[..], Some(3)))?;
+
+    assert_eq!(fs::read(root.path().join("escaped.txt"))?, b"original");
+    assert_eq!(fs::read(root.path().join("escaped (2).txt"))?, b"new");
     Ok(())
 }
 

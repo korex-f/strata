@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-use super::{ExtractNameResolver, ExtractionDestination, validated_archive_path};
+use super::{
+    ExtractNameResolver, ExtractionDestination, sanitize_member_path, validated_archive_path,
+};
 use std::{
     error::Error,
     ffi::OsString,
@@ -34,6 +36,21 @@ fn archive_paths_must_be_nonempty_confined_relative_paths() -> Result<(), Box<dy
         Path::new("folder/nested/item.txt")
     );
     Ok(())
+}
+
+#[test]
+fn unsafe_archive_paths_are_sanitized_to_nonempty_relative_paths() {
+    for (name, expected) in [
+        ("../escaped.txt", "escaped.txt"),
+        ("../../escaped.txt", "escaped.txt"),
+        ("/absolute/path.txt", "absolute/path.txt"),
+        ("safe/../path.txt", "safe/path.txt"),
+        ("C:\\absolute\\path.txt", "absolute/path.txt"),
+        ("../../", "unnamed"),
+    ] {
+        assert_eq!(sanitize_member_path(name), expected, "{name:?}");
+        assert!(validated_archive_path(&sanitize_member_path(name)).is_ok());
+    }
 }
 
 #[test]

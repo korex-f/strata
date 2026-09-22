@@ -5,6 +5,7 @@
     reason = "UnRAR's safe wrapper cannot stream or cancel member output; keep FFI confined to this adapter"
 )]
 
+use super::super::destination::sanitize_member_path;
 use super::super::{check_archive_cancelled, extraction::MemberSink};
 use super::{
     ArchiveError, ArchiveOutcome, ExtractionSession, MemberContent, archive_failed,
@@ -226,6 +227,7 @@ pub(in crate::adapters::local_operations::archive) fn extract_rar(
                 .take_while(|ch| **ch != 0)
                 .map(|ch| char::from_u32(*ch as u32).unwrap_or(char::REPLACEMENT_CHARACTER))
                 .collect();
+            let name = sanitize_member_path(&name);
             let directory = header.flags & native::RHDF_DIRECTORY != 0;
             let size = u64::from(header.unp_size) | (u64::from(header.unp_size_high) << 32);
             let mut process = |sink: &mut MemberSink<'_>| {

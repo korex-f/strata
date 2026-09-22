@@ -47,6 +47,25 @@ pub(super) fn validated_archive_path(name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Converts an archive member name into a non-empty relative path.
+pub(super) fn sanitize_member_path(name: &str) -> String {
+    let normalized = name.replace('\\', "/");
+    let components = normalized.split('/').filter(|component| {
+        !component.is_empty()
+            && *component != "."
+            && *component != ".."
+            && !(component.len() >= 2
+                && component.as_bytes()[0].is_ascii_alphabetic()
+                && component.as_bytes()[1] == b':')
+    });
+    let sanitized = components.collect::<Vec<_>>().join("/");
+    if sanitized.is_empty() {
+        "unnamed".to_owned()
+    } else {
+        sanitized
+    }
+}
+
 /// Returns `name` with ` ({index})` inserted before the extension.
 ///
 /// Used by [`ExtractionDestination::available_name`] to pick `readme (2).txt`

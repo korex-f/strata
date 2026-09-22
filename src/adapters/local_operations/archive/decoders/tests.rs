@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+use super::super::destination::sanitize_member_path;
 use super::super::fixtures::{
     RAR_COMMENT_HPW_FIXTURE, RAR_ENCRYPTED_FIXTURE, RAR_UNICODE_FIXTURE, RAR_VERSION_FIXTURE,
     always_cancelled, completed_extract, extract_zip, never_cancelled, patch_zip_uncompressed_size,
@@ -53,6 +54,32 @@ fn decode_fixture(
         ),
         ArchiveFormat::Rar => extract_rar(archive, destination, password, progress, &cancelled),
     }
+}
+
+fn rar_fixture_with_names(names: [&[u8; 7]; 3]) -> Vec<u8> {
+    let fixture = RAR_VERSION_FIXTURE;
+    let mut archive = fixture[..20].to_vec();
+    for name in names {
+        let mut header = fixture[20..59].to_vec();
+        header[32..39].copy_from_slice(name);
+        let mut checksum = 0xffff_ffffu32;
+        for byte in &header[2..] {
+            checksum ^= u32::from(*byte);
+            for _ in 0..8 {
+                checksum = if checksum & 1 != 0 {
+                    (checksum >> 1) ^ 0xedb8_8320
+                } else {
+                    checksum >> 1
+                };
+            }
+        }
+        let checksum = (!checksum).to_le_bytes();
+        header[..2].copy_from_slice(&checksum[..2]);
+        archive.extend(header);
+        archive.extend(&fixture[59..80]);
+    }
+    archive.extend(&fixture[80..]);
+    archive
 }
 
 #[test]
@@ -324,7 +351,7 @@ fn tar_extraction_root_only_completes_without_a_name_and_respects_cancellation()
 }
 
 #[test]
-fn tar_extraction_rejects_empty_paths_and_root_file_entries() -> Result<(), Box<dyn Error>> {
+fn tar_extraction_sanitizes_empty_paths_and_root_file_entries() -> Result<(), Box<dyn Error>> {
     for gzip in [false, true] {
         for (entry_type, name) in [
             (tar::EntryType::Directory, ""),
@@ -341,74 +368,158 @@ fn tar_extraction_rejects_empty_paths_and_root_file_entries() -> Result<(), Box<
             write_tar_entries(&archive, &[(entry_type, name, b"")], gzip)?;
             let progress = Arc::new(AtomicUsize::new(0));
             assert!(
-                matches!(
-                    extract_tar(&archive, &destination, gzip, &progress, &never_cancelled()),
-                    Err(ArchiveError::Failed(_))
-                ),
-                "accepted {entry_type:?} {name:?}, gzip={gzip}"
+                extract_tar(&archive, &destination, gzip, &progress, &never_cancelled()).is_ok(),
+                "rejected {entry_type:?} {name:?}, gzip={gzip}"
             );
-            assert_eq!(progress.load(Ordering::Relaxed), 0);
-            assert!(fs::read_dir(&destination)?.next().is_none());
+            assert!(destination.join("unnamed").exists() || entry_type.is_dir());
         }
     }
     Ok(())
 }
 
 #[test]
-fn every_archive_format_rejects_parent_traversal() -> Result<(), Box<dyn Error>> {
-    let root = tempfile::tempdir()?;
-    let destination = root.path().join("destination");
-    fs::create_dir(&destination)?;
-    let zip_path = root.path().join("malicious.zip");
-    let tar_path = root.path().join("malicious.tar");
-    let tar_gz_path = root.path().join("malicious.tar.gz");
-    let seven_z_path = root.path().join("malicious.7z");
-    write_zip(&zip_path, &[("../zip-marker", b"escaped")])?;
-    write_tar(&tar_path, "../tar-marker", b"escaped", false)?;
-    write_tar(&tar_gz_path, "../tar-gz-marker", b"escaped", true)?;
-    write_7z(&seven_z_path, "../seven-z-marker", b"escaped")?;
-
-    assert!(extract_zip(&zip_path, &destination).is_err());
-    assert!(
-        extract_tar(
-            &tar_path,
-            &destination,
-            false,
-            &Arc::new(AtomicUsize::new(0)),
-            &never_cancelled(),
-        )
-        .is_err()
-    );
-    assert!(
-        extract_tar(
-            &tar_gz_path,
-            &destination,
-            true,
-            &Arc::new(AtomicUsize::new(0)),
-            &never_cancelled(),
-        )
-        .is_err()
-    );
-    assert!(
-        extract_7z_from_reader(
-            fs::File::open(&seven_z_path)?,
-            &destination,
-            sevenz_rust2::Password::empty(),
-            &Arc::new(AtomicUsize::new(0)),
-            &never_cancelled(),
-        )
-        .is_err()
-    );
-
-    for marker in [
-        "zip-marker",
-        "tar-marker",
-        "tar-gz-marker",
-        "seven-z-marker",
+fn every_archive_format_sanitizes_parent_traversal_and_continues() -> Result<(), Box<dyn Error>> {
+    for format in [
+        ArchiveFormat::Zip,
+        ArchiveFormat::SevenZ,
+        ArchiveFormat::Tar,
+        ArchiveFormat::TarGz,
     ] {
-        assert!(!root.path().join(marker).exists(), "created {marker}");
+        let root = tempfile::tempdir()?;
+        let destination = root.path().join("destination");
+        fs::create_dir(&destination)?;
+        let archive = root.path().join("archive");
+        match format {
+            ArchiveFormat::Zip => write_zip(
+                &archive,
+                &[
+                    ("before.txt", b"before"),
+                    ("../escaped.txt", b"escaped"),
+                    ("after.txt", b"after"),
+                ],
+            )?,
+            ArchiveFormat::SevenZ => write_7z_entries(
+                &archive,
+                &[
+                    ("before.txt", b"before"),
+                    ("../escaped.txt", b"escaped"),
+                    ("after.txt", b"after"),
+                ],
+            )?,
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => write_tar_entries(
+                &archive,
+                &[
+                    (tar::EntryType::Regular, "before.txt", b"before"),
+                    (tar::EntryType::Regular, "../escaped.txt", b"escaped"),
+                    (tar::EntryType::Regular, "after.txt", b"after"),
+                ],
+                format == ArchiveFormat::TarGz,
+            )?,
+            ArchiveFormat::Rar => unreachable!(),
+        }
+
+        let progress = Arc::new(AtomicUsize::new(0));
+        let outcome = match format {
+            ArchiveFormat::Zip => extract_zip(&archive, &destination)?,
+            ArchiveFormat::SevenZ => completed_extract(extract_7z_from_reader(
+                fs::File::open(&archive)?,
+                &destination,
+                sevenz_rust2::Password::empty(),
+                &progress,
+                &never_cancelled(),
+            )?)?,
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => completed_extract(extract_tar(
+                &archive,
+                &destination,
+                format == ArchiveFormat::TarGz,
+                &progress,
+                &never_cancelled(),
+            )?)?,
+            ArchiveFormat::Rar => unreachable!(),
+        };
+        assert_eq!(outcome, Some("before.txt".to_owned()), "{format:?}");
+        for (name, contents) in [
+            ("before.txt", b"before".as_slice()),
+            ("escaped.txt", b"escaped".as_slice()),
+            ("after.txt", b"after".as_slice()),
+        ] {
+            assert_eq!(fs::read(destination.join(name))?, contents, "{format:?}");
+        }
+        assert!(!root.path().join("escaped.txt").exists());
     }
     Ok(())
+}
+
+#[test]
+fn hostile_member_paths_remain_confined_for_every_sanitized_format() -> Result<(), Box<dyn Error>> {
+    for format in [
+        ArchiveFormat::Zip,
+        ArchiveFormat::SevenZ,
+        ArchiveFormat::Tar,
+        ArchiveFormat::TarGz,
+    ] {
+        let root = tempfile::tempdir()?;
+        let destination = root.path().join("destination");
+        fs::create_dir(&destination)?;
+        let archive = root.path().join("archive");
+        match format {
+            ArchiveFormat::Zip => write_zip(
+                &archive,
+                &[("../../outside", b"one"), ("/absolute", b"two")],
+            )?,
+            ArchiveFormat::SevenZ => write_7z_entries(
+                &archive,
+                &[("../../outside", b"one"), ("/absolute", b"two")],
+            )?,
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => write_tar_entries(
+                &archive,
+                &[
+                    (tar::EntryType::Regular, "../../outside", b"one"),
+                    (tar::EntryType::Regular, "/absolute", b"two"),
+                ],
+                format == ArchiveFormat::TarGz,
+            )?,
+            ArchiveFormat::Rar => unreachable!(),
+        }
+        let progress = Arc::new(AtomicUsize::new(0));
+        match format {
+            ArchiveFormat::Zip => {
+                extract_zip(&archive, &destination)?;
+            }
+            ArchiveFormat::SevenZ => {
+                completed_extract(extract_7z_from_reader(
+                    fs::File::open(&archive)?,
+                    &destination,
+                    sevenz_rust2::Password::empty(),
+                    &progress,
+                    &never_cancelled(),
+                )?)?;
+            }
+            ArchiveFormat::Tar | ArchiveFormat::TarGz => {
+                completed_extract(extract_tar(
+                    &archive,
+                    &destination,
+                    format == ArchiveFormat::TarGz,
+                    &progress,
+                    &never_cancelled(),
+                )?)?;
+            }
+            ArchiveFormat::Rar => unreachable!(),
+        }
+        assert!(destination.join("outside").exists(), "{format:?}");
+        assert!(destination.join("absolute").exists(), "{format:?}");
+        assert!(!root.path().join("outside").exists(), "{format:?}");
+        assert!(!root.path().join("absolute").exists(), "{format:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn rar_member_names_use_the_shared_sanitization_policy() {
+    for name in ["../escaped.txt", "../../outside", "/absolute"] {
+        let sanitized = sanitize_member_path(name);
+        assert!(super::super::destination::validated_archive_path(&sanitized).is_ok());
+    }
 }
 
 #[test]
@@ -1435,6 +1546,35 @@ fn rar_extracts_simple_archive() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(progress.load(Ordering::Relaxed), 1);
     assert_eq!(fs::read(destination.join("VERSION"))?, b"unrar-0.4.0");
+    Ok(())
+}
+
+#[test]
+fn rar_sanitizes_unsafe_member_names_before_extraction() -> Result<(), Box<dyn Error>> {
+    let root = tempfile::tempdir()?;
+    let archive = root.path().join("unsafe.rar");
+    fs::write(
+        &archive,
+        rar_fixture_with_names([b"before1", b"../xabc", b"after11"]),
+    )?;
+    let destination = root.path().join("destination");
+    fs::create_dir(&destination)?;
+    let progress = Arc::new(AtomicUsize::new(0));
+
+    assert_eq!(
+        completed_extract(extract_rar(
+            &archive,
+            &destination,
+            None,
+            &progress,
+            &never_cancelled(),
+        )?)?,
+        Some("before1".to_owned())
+    );
+    assert_eq!(fs::read(destination.join("before1"))?, b"unrar-0.4.0");
+    assert_eq!(fs::read(destination.join("xabc"))?, b"unrar-0.4.0");
+    assert_eq!(fs::read(destination.join("after11"))?, b"unrar-0.4.0");
+    assert!(!root.path().join("xabc").exists());
     Ok(())
 }
 
